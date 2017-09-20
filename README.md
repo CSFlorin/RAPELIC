@@ -54,4 +54,9 @@
 
   Files: https://drive.google.com/drive/u/1/folders/0B3W_nrvkqQbTOUVuSjdreGFBaVk
 
-  Download: 
+  Download: https://github.com/CSFlorin/RAPELIC/blob/master/ARBdownload.py
+
+## Census Block Groups
+  Site: https://www.census.gov/geo/maps-data/data/tiger-line.html
+
+  Files: https://github.com/CSFlorin/RAPELIC/tree/master/ca_blockgroup
