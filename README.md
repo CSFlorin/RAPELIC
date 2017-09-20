@@ -38,6 +38,11 @@
 
   Reference: http://geopandas.org/index.html
 
+## Folium:
+  Install: `conda install folium`
+
+  Reference: https://github.com/python-visualization/folium
+
 ## ArcGIS API for Python:
   Install: `conda install -c esri arcgis`
 
