@@ -1,4 +1,11 @@
 """
+California Industrial and Auto Pollution API
+Author: Florin Langer, UC Berkeley Renewable and Appropriate Energy Lab with Lawrence Berkeley National Laboratory
+Sources: California Air Resources Board
+"""
+
+
+"""
 Imports
 """
 
@@ -19,83 +26,747 @@ import unicodedata
 import pysal as ps
 import json
 import os.path
-
 import math
 import ogr
 import shapefile as shp # pyshp
 import math
 
+
 """
 Helpers
 """
 
-# Pick a nonconflicting save name for a file to not overwrite previous ones.
-def save_name(name, extension):
+def save_name(name, extension=''):
+    """ Return nonconflicting save name including extension for a file """
     i = 0
     fname = name
     while os.path.isfile(fname + extension):
-        fname = name + str(i)
+        fname = name + '_' + str(i)
         i += 1
     return fname + extension
 
-# Reads blocks into a geopandas dataframe
-def read_blocks(name, county_code):
-    blockgroups = gpd.read_file(name)
-    # print("blocks shape before drop: {0}".format(blockgroups.shape))
-    blockgroups = blockgroups[blockgroups['COUNTYFP'] == county_code] # Only keep blocks in that county
-    # print("blocks shape after drop: {0}".format(blockgroups.shape))
-    return blockgroups
+def county_code(county, file_type):
+    """
+    Return the properly formatted county code string for a county
+        county: 'LA', 'Fresno'
+        file_type: 'census_area', 'arb_facilities'
+    """
+    if file_type == 'census_area':
+        # All codes: https://www2.census.gov/geo/docs/reference/codes/files/st06_ca_cou.txt
+        if county == 'LA':
+            return '037'
+        if county == 'Fresno':
+            return '019'
+    elif file_type == 'arb_facilities':
+        if county == 'LA':
+            return '19'
+        if county == 'Fresno':
+            return '10'
 
-# Converts csv of lats/lons to a geopandas dataframe
-# https://gis.stackexchange.com/questions/114066/handling-kml-csv-with-geopandas-drivererror-unsupported-driver-ucsv
-def read_points(name):
-    facilities = pd.read_csv(name)
-    # print("facilities shape before drop: {0}".format(facilities.shape))
-    facilities = facilities[pd.notnull(facilities['lat'])] # drop ungeocoded rows; can also use np.isfinite
+def read_census_shape(area, county=''):
+    """
+    Read California census area shapefile into a GeoDataFrame and return it filtered to a county if specified
+        area: 'blockgroup', 'block'
+        county: 'LA', 'Fresno'
+    """
+    if area == 'blockgroup':
+        area = gpd.read_file('data/ca_blockgroup/tl_2016_06_bg.shp')
+    elif area == 'block':
+        area = gpd.read_file('data/ca_block/tl_2016_06_tabblock10.shp')
+    else:
+        raise ValueError('area must be LA or Fresno')
+    if county: # Only keep area in that county if specified
+        area = area[area['COUNTYFP'] == county_code(county, 'census_area')]
+    return area
+
+def read_facilities(county):
+    """
+    Read csv of lats/lons and return a GeoDataFrame
+        county: 'LA', 'Fresno'
+    """
+    facilities = pd.read_csv('data/ARB_OUT/' + county_code(county, 'arb_facilities') + '.csv')
+    # https://gis.stackexchange.com/questions/114066/handling-kml-csv-with-geopandas-drivererror-unsupported-driver-ucsv
     facilities['geometry'] = facilities.apply(lambda z: Point(z.lon, z.lat), axis=1)
     facilities = gpd.GeoDataFrame(facilities)
-    facilities = facilities[facilities.within(read_blocks('ca_blockgroup/tl_2016_06_bg.shp', '019').unary_union)] # drop rows outside region
-    # facilities = gpd.GeoDataFrame(facilities)
-    # print("facilities shape after drop: {0}".format(facilities.shape)) # one more column since we added geometry
+    facilities = facilities[facilities.within(read_census_shape('blockgroup', county).unary_union)] # Drop rows outside region in case any were misgeocoded
     return facilities
 
-# Adds up column NAME for all POINTS in each POLYGON
-def agg_points_col(name, points, polygons):
-    blockgroups = read_blocks(polygons, '019')
+def agg_facilities_column(area, county, column, output='percent', damages=True):
+    """
+    Return geopandas dataframe with values of column added up for all facilities in each polygon
+        area: 'blockgroup', 'block', 'grid'
+        county: 'LA', 'Fresno'
+        column: 'PM2.5T', 'PM10T', 'PMT', 'SOXT', 'NOXT', 'COT', 'ROGT', 'TOGT'
+        output: 'percent', 'actual'
+        damages: If output == 'percent', whether to calculate cell damages or just cell percents
+    """
+    if area == 'grid':
+        area = gpd.read_file('data/MEDS/grid.shp').to_crs(epsg=4326) # Match crs of facilities
+    else:
+        area = read_census_shape(area, county)
+    facilities = read_facilities(county)
+    # Convert facilities crs to match area's
+    facilities.crs = area.crs
+    # facilities.crs = {'init': 'epsg:4326', 'no_defs': True} # crs for naive geometries per https://github.com/geopandas/geopandas/issues/245
+    # Ensure all values in column have a value for addition
+    facilities[column].fillna(0)
+    # area.crs = facilities.crs # make facilities projection that of blockgroups
+    # Give table of facilities with new column 'index_right' being which polygon each falls in
+    facilities = gpd.sjoin(facilities, area, op='within')
+    # Sum pollutants for all points within each polygon
+    total = facilities.groupby('index_right')[column].sum().to_frame() # Convert Series to DataFrame
+    # Join counted values for each area back to area by index and drop unmatched rows
+    area = area.join(total).dropna() # Can also do blockgroups.merge(total, on="right_index")
+
+    if output != 'actual':
+        sum_v = sum(area[column])
+        if damages:
+            if county == 'Fresno':
+                area[column] = (area[column]/sum_v)*19900000 # Total PM2.5 damages for Fresno
+            elif county == 'LA':
+                area[column] = (area[column]/sum_v)*243000000 # Total PM2.5 damages for LA
+        else:
+            # Divide each cell by total
+            area[column] = (area[column]/sum_v)*100
+
+    new_name = save_name('out/facilities/' + county + column, '.shp')
+    area.to_file(new_name)
+    return area
+
+def agg_facilities_allcols(area, county):
+    """
+    Return geopandas dataframe with values of each column added up for all facilities in each polygon
+        area: 'blockgroup', 'block'
+        county: 'LA', 'Fresno'
+    """
+    area = read_census_shape(area, county)
+    facilities = read_facilities(county)
+    # Convert facilities crs to match area's
+    facilities.crs = area.crs
+    area = gpd.sjoin(area, facilities)
+    area = area.dissolve(by='GEOID', aggfunc='sum') # Alternative is blockgroups.groupby('geometry')['PMT'].sum()
+    return area
+
+def create_grid(name='grid', minx=-684000, maxx=600000, miny=-564000, maxy=600000, dx=4000, dy=4000):
+    """ Write PMEDS grid shapefile composed of squares """
+    nx = int(math.ceil(abs(maxx - minx)/dx))
+    ny = int(math.ceil(abs(maxy - miny)/dy))
+    shift = (maxy - miny)/dy
+    w = shp.Writer(shp.POLYGON)
+    w.autoBalance = 1
+    w.field('ID', 'C')
+    w.field('i', 'N') # Make int instead of object
+    w.field('j', 'N')
+    square_id = 0
+    for j in range(0, ny): # 0-index in loop for calculations
+        for i in range(0, nx):
+            vertices = []
+            parts = []
+            vertices.append([min(minx+dx*i,maxx), max(maxy-dy*j,miny)])
+            vertices.append([min(minx+dx*(i+1),maxx), max(maxy-dy*j,miny)])
+            vertices.append([min(minx+dx*(i+1),maxx), max(maxy-dy*(j+1),miny)])
+            vertices.append([min(minx+dx*i,maxx), max(maxy-dy*(j+1),miny)])
+            parts.append(vertices)
+            w.poly(parts)
+            w.record(square_id,i+1,shift-j) # 1-index when storing i and j
+            square_id += 1
+    w.save(save_name(name))
+
+def read_pmeds(county):
+    """
+    Return dataframe of PMEDS file
+        county: 'LA', 'Fresno'
+    """
+    fn = 'data/MEDS/' + county + '_07d15'
+    # Read in fixed-width columns
+    df = pd.read_fwf(fn, widths=[8, 14, 14, 3, 3, 9, 5, 2, 5, 2, 2, 3, 3, 5], skiprows=0, header=None)
+    # Read comma-separated columns; assumes no commas in first 79 characters since using read_csv
+    df2 = pd.read_csv(fn, header=None)
+    df2[df2.columns[0]] = df2[df2.columns[0]].map(lambda x: x[78:])
+    # Concatenate dataframes
+    df = pd.concat([df, df2], axis=1)
+    # Name columns
+    df.columns = ['scenario', 'sic', 'SCC', 'i', 'j', 'facid', 'stackid', 'county',
+    'julianday', 'beginhour', 'endhour', 'airbasin', 'subcounty', 'elevation', 'COT',
+    'NOXT', 'SOXT', 'TOGT', 'PMT', 'NH3']
+    # Calculate pm2.5 for pmeds
+    ratio_df = pd.read_csv('data/MEDS/rogpm.11jan2017.txt')
+    ratio_df = ratio_df.loc[ratio_df['Year'] == 2010] # year is int, and match with year of pmeds
+    # Match scc, year in ratio_df to scc in df, scc is int, sic is float
+    df = df.merge(ratio_df,  how='inner', on=['SCC']) # columns to keep
+    df['PM2.5T'] = df['PMT'] * df['PM2_5/TPM'] # Multiply pm by conversion factor for pm2.5
+    # Fill NaN values with 0
+    df.fillna(0, inplace=True)
+    return df
+
+def agg_pmeds_column(county, column, scc='', output='percent', updated=True, damages=False):
+    """
+    Return geodataframe of PMEDS column added up for each grid cell
+        county: 'LA', 'Fresno'
+        column: 'PM2.5T', 'PMT', 'SOXT', 'NOXT', 'COT', 'NH3', 'TOGT'
+        scc: 'LD', 'HD', ''
+        output: 'percent', 'actual'
+        updated: If output == 'actual', True to update to 2015 values
+        damages: If output == 'percent', True to calculate cell damages and False for just cell percents
+    """
+    df = read_pmeds(county)
+
+    # Only keep SCCs we want, if specified
+    if scc == 'LD':
+        df = df[df['SCC'].isin([202,203,204,205,206,207,209,210,211,212,213,214,215,216,218,219,221,808,813,814,817,820])]
+    elif scc == 'HD':
+        df = df[df['SCC'].isin([302,303,304,305,306,307,309,310,311,312,313,314,315,316,318,319,321,408,508,413,513,613,414,514,614,617,717,420,520,620])]
+
+    # Add up individual squares' pm
+    df[column] = df.groupby(['i', 'j'])[column].transform('sum') # Add each row containing same i, j, but keep dupes
+    df = df.drop_duplicates(['i', 'j']) # Get rid of dupes
+
+    if output == 'actual':
+        if updated:
+            # Divide each cell by total
+            sum_v = sum(df[column])
+            df[column] = df[column]/sum_v
+            # Update to 2015 vals using tons/day
+            if county == 'Fresno':
+                # https://www.arb.ca.gov/app/emsinv/2017/emssumcat_query.php?F_YR=2015&F_DIV=-4&F_SEASON=A&SP=SIP105ADJ&F_AREA=CO&F_CO=10&F_COAB=#7
+                if scc == 'LD':
+                    df[column] = df[column]*.44*365
+                elif scc == 'HD':
+                    df[column] = df[column]*.65*365
+                else:
+                    df[column] = df[column]*1.09*365
+            elif county == 'LA':
+                # https://www.arb.ca.gov/app/emsinv/2017/emssumcat_query.php?F_YR=2015&F_DIV=-4&F_SEASON=A&SP=SIP105ADJ&F_AREA=CO&F_CO=19&F_COAB=#7
+                if scc == 'LD':
+                    df[column] = df[column]*4.9*365
+                elif scc == 'HD':
+                    df[column] = df[column]*2.05*365
+                else:
+                    df[column] = df[column]*6.95*365
+        else:
+            df[column] = df[column]*0.00110231*24*365 # Convert kg/hr to tons/yr after aggregation
+    else:
+        if damages:
+            sum_v = sum(df[column])
+            if county == 'Fresno':
+                if scc == 'LD':
+                    df[column] = (df[column]/sum_v)*9741393 # LD damages
+                elif scc == 'HD':
+                    df[column] = (df[column]/sum_v)*18369483
+                else:
+                    df[column] = (df[column]/sum_v)*28110876
+            elif county == 'LA':
+                if scc == 'LD':
+                    df[column] = (df[column]/sum_v)*457609951
+                elif scc == 'HD':
+                    df[column] = (df[column]/sum_v)*281522511
+                else:
+                    df[column] = (df[column]/sum_v)*739132462
+        else:
+            # Divide each cell by total
+            sum_v = sum(df[column])
+            df[column] = (df[column]/sum_v)*100
+
+    # Join with grid shapefile
+    gdf = gpd.read_file('data/MEDS/grid.shp') # gdf shape 93411 by 4
+
+    # Keep only right or inner
+    merged_df = gdf.merge(df,  how='right', on=['i','j'])[[column, 'i', 'j', 'geometry', 'ID']] # Columns to keep, shape 599 by 2
+    # print(merged_df.sort_values(['pm'], ascending=[False]).head())
+    new_name = save_name('out/MEDS/' + county + column + scc, '.shp')
+    merged_df.to_file(new_name)
+
+    # Add projection file
+    from shutil import copy2
+    copy2('data/MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+    return merged_df
+
+# TODO: Fix following code
+
+""" Return dataframe with total pm in a column """
+def add_pmeds_facilities(fn, coid, shpfn, pol):
+    pmeds = read_pmeds(fn)
+    # Add up individual squares' pm
+    pmeds[pol] = pmeds.groupby(['i', 'j'])[pol].transform('sum') # adds each row containing same i, j, but keeps dupes
+    pmeds = pmeds.drop_duplicates(['i', 'j']) # get rid of dupe rows
+    # Normalize PMEDS from 0 to 1
+    pol_max = max(pmeds[pol])
+    pmeds[pol] = pmeds[pol]/pol_max
+    # Adjust PMEDS for more accurate data and to tons/year
+    pmeds[pol] = pmeds[pol].map(lambda x: 365*1.09*x)
+
+    grid = gpd.read_file(shpfn).to_crs(epsg=4326) # match crs of facilities
+    facilities = read_points('ARB_OUT/' + str(coid) + '.csv')
+    facilities.crs = {'init': 'epsg:4326', 'no_defs': True} # the crs for naive geometries per https://github.com/geopandas/geopandas/issues/245
+
+    pol2 = pol.upper() + '2.5T' if pol == 'pm' else pol.upper() + 'T' # pol name in facilities
+    facilities[pol2].fillna(0) # make sure all values in column NAME have a value in case
+    grid.crs = facilities.crs # make facilities projection that of blockgroups
+    # Gives table of facilities with column 'index_right' being which polygon each falls in
+    facilities = gpd.sjoin(facilities, grid, how='right', op='within')
+    # Sums pol2 for all facilities within a certain square
+    facilities = facilities.groupby('index_right')[pol2].sum().to_frame() # need to convert Series to DF, this is just index_right, PM2.5T
+    # Join counted values for each blockgroup back to blockgroups by blockgroup index and drop unmatched rows
+    # Can also do blockgroups.merge(total, on="right_index")
+    facilities = grid.join(facilities) # join back with grid for i, j values and geometry
+    gdf = facilities.merge(pmeds, how='outer', on=['i','j'])[['i', 'j', 'geometry', pol2, pol]]
+    gdf[pol] = gdf.apply(lambda row: row[pol] + row[pol2], axis=1)
+    gdf.to_file('test2.shp')
+    gdf = gdf[pd.notnull(gdf[pol])]
+
+    return gdf[['i', 'j', 'geometry', pol]]
+
+""" Get percent that SCC_NAME (HD, LD, or I) is of total of POL
+    COID is 19 for LA, 10 for Fresno
+"""
+def calculate_total(fn, coid, shpfn, pol, scc_name=''):
+    df = read_pmeds(fn)
+
+    # Codes from PMEDS SCC Emission Categories Chart
+    if scc_name == 'HD':
+        numerator = df[df['scc'].isin([302,303,304,305,306,307,309,310,311,312,313,314,315,316,318,319,321,408,508,413,513,613,414,514,614,617,717,420,520,620])].copy()
+    else: # LD
+        numerator = df[df['scc'].isin([202,203,204,205,206,207,209,210,211,212,213,214,215,216,218,219,221,808,813,814,817,820])].copy()
+
+    # Add up individual squares' pm
+    df[pol] = df.groupby(['i', 'j'])[pol].transform('sum') # adds each row containing same i, j, but keeps dupes
+    df = df.drop_duplicates(['i', 'j']) # get rid of dupe rows
+    numerator[pol] = numerator.groupby(['i', 'j'])[pol].transform('sum') # adds each row containing same i, j, but keeps dupes
+    numerator = numerator.drop_duplicates(['i', 'j']) # get rid of dupes
+
+    # Normalize scc_name over total pol for pmeds
+    numerator = numerator.merge(df,  how='inner', on=['i','j'])[['i', 'j', pol+'_x', pol+'_y']]
+    df_max = max(df[pol])
+    numerator[pol] = numerator.apply(lambda row: row[pol+'_x']/df_max, axis=1) # row[pol+'_y']
+    # Multiply by appropriate mobile sources from https://www.arb.ca.gov/app/emsinv/2017/emssumcat_query.php?F_YR=2015&F_DIV=-4&F_SEASON=A&SP=SIP105ADJ&F_AREA=CO&F_CO=10&F_COAB=#7
+    if scc_name == 'LD':
+        numerator[pol] = numerator[pol].map(lambda x: 365*.35*x) # and convert from tons/day to tons/year
+    else: # HD
+        numerator[pol] = numerator[pol].map(lambda x: 365*.74*x)
+    numerator = numerator[[pol, 'i', 'j']]
+
+    total = add_pmeds_facilities(fn, coid, shpfn, pol)
+    # Keep only right or inner
+    merged_df = total.merge(numerator,  how='inner', on=['i','j'])[[pol + '_x', pol + '_y', 'geometry']] # columns to keep, shape 599 by 2
+    merged_df[pol] = merged_df.apply(lambda row: row[pol+'_y']/row[pol+'_x'], axis=1) # numerator/total
+    # merged_df = merged_df[pd.notnull(merged_df[pol])]
+    # merged_df = gdf.merge(df, how='right', on=['i', 'j'])
+    # print(merged_df.sort_values(['pm'], ascending=[False]).head())
+    # print(merged_df.shape)
+    new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name + '_total', '.shp')
+    merged_df[[pol, 'geometry']].to_file(new_name)
+
+    # No need to add projection file since we reprojected in geopandas
+    # Add projection file
+    # from shutil import copy2
+    # copy2('MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+
+""" Total emissions """
+def calculate_total2(fn, shpfn, pol, name, points, scc_name='', scc=[]):
+    """ PMEDS """
+    df = read_pmeds(fn)
+    # only keep SCCs we want, if specified
+    if scc:
+        print(df.shape)
+        df = df[df['scc'].isin(scc)]
+        print(df.shape)
+
+    # Add up individual sources' pm
+    df[pol] = df.groupby(['i', 'j'])[pol].transform('sum') # adds each row containing same i, j, but keeps dupes
+    df = df.drop_duplicates(['i', 'j']) # get rid of dupes
+
+    # Get max total square
+    df2 = read_pmeds(fn)
+    df2[pol] = df2.groupby(['i', 'j'])[pol].transform('sum') # adds each row containing same i, j, but keeps dupes
+    df2 = df2.drop_duplicates(['i', 'j']) # get rid of dupes
+    max_v = max(df2[pol])
+
+    df[pol] = df[pol]/max_v
+
+    # Update to 2015 values
+    if scc_name == 'LD':
+        df[pol] = df[pol]*.44*365
+    elif scc_name == 'HD':
+        df[pol] = df[pol]*.65*365
+    elif scc_name == 'Both':
+        df[pol] = df[pol]*1.09*365
+
+    # i (int64) range 163 to 214
+    # j (int64) range 115 to 149
+    # df shape 599 by 20
+    # print(df.shape)
+    # print(df.head())
+    # print(df['j'].min())
+    # print(df['j'].max())
+    print(df.shape)
+
+    # print(df.sort_values(['pm'], ascending=[False]).head())
+    # Join with grid shapefile
+    # # gdf = gpd.read_file(shpfn) # gdf shape 93411 by 4
+    # print(gdf.dtypes)
+
+    # NOTE: Make sure dtypes of the columns in both tables are the same
+    # gdf['i'] = gdf['i'].map(lambda x: 291 - x) # switch which side i starts from
+    # gdf['j'] = gdf['j'].map(lambda x: x+1) # fix j being off by 1
+    # x/j is 1 to 321, y/i is 1 to 291
+    # Keep only right or inner
+    # # merged_df = gdf.merge(df,  how='right', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', pol, 'geometry']] # columns to keep, shape 599 by 2
+    # now have raw values for pmeds
+    # new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    # merged_df.to_file(new_name)
+    # exit()
+    """ FACILITIES """
+    blockgroups = gpd.read_file(shpfn).to_crs(epsg=4326) # match crs of facilities
     # print("blocks shape before add: {0}".format(blockgroups.shape))
-    facilities = read_points(points)
+    facilities = read_points('ARB_OUT/' + str(points) + '.csv')
+    facilities.crs = {'init': 'epsg:4326', 'no_defs': True} # the crs for naive geometries per https://github.com/geopandas/geopandas/issues/245
+
     # make sure all values in column NAME have a value in case
     facilities[name].fillna(0)
-    facilities.crs = blockgroups.crs # make facilities projection that of blockgroups
+    blockgroups.crs = facilities.crs # make facilities projection that of blockgroups
     # Gives table of facilities with column 'index_right' being which polygon each falls in
     facilities = gpd.sjoin(facilities, blockgroups, op='within')
     # Sums pollutants for all points within a certain polygon
     total = facilities.groupby('index_right')[name].sum().to_frame() # need to convert Series to DF
     # Join counted values for each blockgroup back to blockgroups by blockgroup index and drop unmatched rows
-    # Can also do blockgroups.merge(total, on="right_index")
     blockgroups = blockgroups.join(total).dropna()
-    # print("blocks shape after add: {0}".format(blockgroups.shape))
-    return blockgroups
+    # now have raw values for facilities
+    # print(blockgroups.dtypes)
+    # blockgroups = blockgroups[['i', 'j', name]] # get rid of geometry col
 
-# Adds up all columns from all points in each blockgroup
-def agg_points_allcols(points, polygons):
-    blockgroups = read_blocks(polygons, '019')
-    # print("blocks shape before add: {0}".format(blockgroups.shape))
-    facilities = read_points(points)
-    facilities.crs = blockgroups.crs # make facilities projection that of blockgroups
-    blockgroups = gpd.sjoin(blockgroups, facilities)
-    blockgroups = blockgroups.dissolve(by='GEOID', aggfunc='sum')
-    # Alternative is blockgroups.groupby('geometry')['PMT'].sum()
-    # print("blocks shape after add: {0}".format(blockgroups.shape))
-    return blockgroups
+    print(df.loc[(df['i'] == 165) & (df['j'] == 138)])
+    print(blockgroups.loc[(blockgroups['i'] == 165) & (blockgroups['j'] == 138)])
+    # exit()
+    # Add the two
+    # merged_df = merged_df.merge(blockgroups,  how='outer', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', pol, name, 'geometry']] # can't hash on geometry
+    merged_df = blockgroups.merge(df,  how='outer', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', pol, name]] # can't hash on geometry
+    print(merged_df.loc[(merged_df['i'] == 165) & (merged_df['j'] == 138)])
+    # exit()
+    # merged_df = gpd.GeoDataFrame(merged_df) # reconvert to gdf after merge
+    # merged_df[pol] = merged_df[pol] + merged_df[name]
+    merged_df.fillna(0, inplace=True) # when adding nan to int, result was nan
+    merged_df[pol] = merged_df.apply(lambda row: row[pol] + row[name], axis=1)
+    print(merged_df.loc[(merged_df['i'] == 165) & (merged_df['j'] == 138)])
+    # exit()
+    # join with grid
+    gdf = gpd.read_file(shpfn) # gdf shape 93411 by 4
+    merged_df = gdf.merge(merged_df,  how='inner', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', pol, 'geometry']]
+    # merged_df = merged_df[['i', 'j', pol, 'geometry']]
 
-# Narrows blocks from a state to a specified county and saves if out_file is not None
-def narrow_state_blocks(county_code, in_file, out_file=None, extension=".shp"):
-    blocks = gpd.read_file(in_file + extension)
-    blocks = blocks[blocks['COUNTYFP10'] == county_code] # Only keep blocks in that county
-    if out_file:
-        blocks.to_file(save_name(out_file, extension))
+    return merged_df
+
+    # new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    # merged_df.to_file(new_name)
+    #
+    # # Add projection file
+    # from shutil import copy2
+    # copy2('MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+
+""" normalized ld and hd """
+def normalize_total(fn, shpfn, pol, scc_name='', scc=[]):
+    df = new_pmeds(fn, shpfn, pol, scc_name, scc)
+
+    # Get max total square
+    df2 = calculate_total2(fn, shpfn, pol, 'PM2.5T', 10, scc_name='Both', scc=[])
+    max_v = max(df2[pol])
+
+    df[pol] = df[pol]/max_v
+
+    # i (int64) range 163 to 214
+    # j (int64) range 115 to 149
+    # df shape 599 by 20
+    # print(df.shape)
+    # print(df.head())
+    # print(df['j'].min())
+    # print(df['j'].max())
+    print(df.shape)
+
+    # print(df.sort_values(['pm'], ascending=[False]).head())
+    # Join with grid shapefile
+    # gdf = gpd.read_file(shpfn) # gdf shape 93411 by 4
+    # # print(gdf.dtypes)
+    #
+    # # NOTE: Make sure dtypes of the columns in both tables are the same
+    # # gdf['i'] = gdf['i'].map(lambda x: 291 - x) # switch which side i starts from
+    # # gdf['j'] = gdf['j'].map(lambda x: x+1) # fix j being off by 1
+    # # x/j is 1 to 321, y/i is 1 to 291
+    # # Keep only right or inner
+    # merged_df = gdf.merge(df,  how='right', left_on=['i','j'], right_on = ['i','j'])[[pol, 'geometry']] # columns to keep, shape 599 by 2
+    # merged_df = gdf.merge(df, how='right', on=['i', 'j'])
+    # print(merged_df.sort_values(['pm'], ascending=[False]).head())
+    # print(merged_df.shape)
+    new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    df.to_file(new_name)
+
+    # Add projection file
+    from shutil import copy2
+    copy2('MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+
+""" for finding normalized facilities """
+def normalize_total2(fn, shpfn, pol, name='PM2.5T', scc_name=''):
+    df = agg_points_col2(name, 10, shpfn)
+
+    # Get max total square
+    df2 = calculate_total2(fn, shpfn, pol, name, 10, scc_name='Both', scc=[])
+    max_v = max(df2[pol])
+
+    df[name] = df[name]/max_v
+
+    # i (int64) range 163 to 214
+    # j (int64) range 115 to 149
+    # df shape 599 by 20
+    # print(df.shape)
+    # print(df.head())
+    # print(df['j'].min())
+    # print(df['j'].max())
+    print(df.shape)
+
+    # print(df.sort_values(['pm'], ascending=[False]).head())
+    # Join with grid shapefile
+    # gdf = gpd.read_file(shpfn) # gdf shape 93411 by 4
+    # # print(gdf.dtypes)
+    #
+    # # NOTE: Make sure dtypes of the columns in both tables are the same
+    # # gdf['i'] = gdf['i'].map(lambda x: 291 - x) # switch which side i starts from
+    # # gdf['j'] = gdf['j'].map(lambda x: x+1) # fix j being off by 1
+    # # x/j is 1 to 321, y/i is 1 to 291
+    # # Keep only right or inner
+    # merged_df = gdf.merge(df,  how='right', left_on=['i','j'], right_on = ['i','j'])[[pol, 'geometry']] # columns to keep, shape 599 by 2
+    # merged_df = gdf.merge(df, how='right', on=['i', 'j'])
+    # print(merged_df.sort_values(['pm'], ascending=[False]).head())
+    # print(merged_df.shape)
+    new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    df.to_file(new_name)
+
+    # Add projection file
+    # from shutil import copy2
+    # copy2('MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+
+
+
+""" PMEDS damages """
+def damages2(fn, shpfn, pol, name, points, scc_name='', scc=[]):
+    """ PMEDS """
+    df = read_pmeds(fn)
+    # only keep SCCs we want, if specified
+    if scc:
+        print(df.shape)
+        df = df[df['scc'].isin(scc)]
+        print(df.shape)
+
+    # Add up individual sources' pm
+    df[pol] = df.groupby(['i', 'j'])[pol].transform('sum') # adds each row containing same i, j, but keeps dupes
+    df = df.drop_duplicates(['i', 'j']) # get rid of dupes
+
+    # Get total square
+    df2 = read_pmeds(fn)
+    if scc:
+        df2 = df2[df2['scc'].isin(scc)]
+    df2[pol] = df2.groupby(['i', 'j'])[pol].transform('sum') # adds each row containing same i, j, but keeps dupes
+    df2 = df2.drop_duplicates(['i', 'j']) # get rid of dupes
+
+    # df = df.merge(df2,  how='inner', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', 'pm_x', 'pm_y']]
+    df2.fillna(0, inplace=True)
+    max_v = sum(df2[pol])
+    print(max_v)
+    df[pol] = df[pol]/max_v
+
+    # Caclulate damages
+    if scc_name == 'LD':
+        df[pol] = df[pol]*(1572107734.352)
+    elif scc_name == 'HD':
+        df[pol] = df[pol]*(2298989169-(1572107734.352))
+    elif scc_name == 'Both':
+        df[pol] = df[pol]*(2298989169)
+
+    # i (int64) range 163 to 214
+    # j (int64) range 115 to 149
+    # df shape 599 by 20
+    # print(df.shape)
+    # print(df.head())
+    # print(df['j'].min())
+    # print(df['j'].max())
+    print(df.shape)
+
+    # print(df.sort_values(['pm'], ascending=[False]).head())
+    # Join with grid shapefile
+    gdf = gpd.read_file(shpfn) # gdf shape 93411 by 4
+    # print(gdf.dtypes)
+
+    # NOTE: Make sure dtypes of the columns in both tables are the same
+    # gdf['i'] = gdf['i'].map(lambda x: 291 - x) # switch which side i starts from
+    # gdf['j'] = gdf['j'].map(lambda x: x+1) # fix j being off by 1
+    # x/j is 1 to 321, y/i is 1 to 291
+    # Keep only right or inner
+    merged_df = gdf.merge(df,  how='right', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', pol, 'geometry']] # columns to keep, shape 599 by 2
+    # now have raw values for pmeds
+    return merged_df
+    # n = int(merged_df.shape[0] * .25)
+    # merged_df = merged_df.nlargest(n, pol)
+    # new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    # merged_df.to_file(new_name)
+    # exit()
+
+""" all damages """
+def damages3(fn, shpfn, pol, name, points, scc_name='Both', scc=[]):
+    fac = damages(fn, points, shpfn, pol)
+    pmeds = damages2(fn, shpfn, pol, name, points, scc_name, scc)
+    # add
+    merged_df = fac.merge(pmeds,  how='outer', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', 'PM2.5 damages', pol]] # get rid of geometry
+    print(merged_df.dtypes)
+
+    # merged_df = gpd.GeoDataFrame(merged_df) # reconvert to gdf after merge
+    # merged_df[pol] = merged_df[pol] + merged_df[name]
+    merged_df.fillna(0, inplace=True) # when adding nan to int, result was nan
+    merged_df[pol] = merged_df.apply(lambda row: row[pol] + row['PM2.5 damages'], axis=1)
+    # exit()
+    # join with grid
+    gdf = gpd.read_file(shpfn) # gdf shape 93411 by 4
+    merged_df = gdf.merge(merged_df,  how='inner', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', pol, 'geometry']]
+    # merged_df = merged_df[['i', 'j', pol, 'geometry']]
+    # new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    # merged_df.to_file(new_name)
+    return merged_df
+
+""" normalized ld and hd """
+def normalize_total_damages(fn, shpfn, pol, name, points, scc_name='', scc=[]):
+    # df = new_pmeds(fn, shpfn, pol, scc_name, scc)
+    df = damages2(fn, shpfn, pol, name, points, scc_name, scc)
+
+    # Get max total square
+    df2 = damages3(fn, shpfn, pol, name, points, scc_name='Both', scc=[])
+    # df2 = calculate_total2(fn, shpfn, pol, 'PM2.5T', 10, scc_name='Both', scc=[])
+    max_v = max(df2[pol])
+
+    df[pol] = df[pol]/max_v
+
+    # i (int64) range 163 to 214
+    # j (int64) range 115 to 149
+    # df shape 599 by 20
+    # print(df.shape)
+    # print(df.head())
+    # print(df['j'].min())
+    # print(df['j'].max())
+    print(df.shape)
+
+    # print(df.sort_values(['pm'], ascending=[False]).head())
+    # Join with grid shapefile
+    # gdf = gpd.read_file(shpfn) # gdf shape 93411 by 4
+    # # print(gdf.dtypes)
+    #
+    # # NOTE: Make sure dtypes of the columns in both tables are the same
+    # # gdf['i'] = gdf['i'].map(lambda x: 291 - x) # switch which side i starts from
+    # # gdf['j'] = gdf['j'].map(lambda x: x+1) # fix j being off by 1
+    # # x/j is 1 to 321, y/i is 1 to 291
+    # # Keep only right or inner
+    # merged_df = gdf.merge(df,  how='right', left_on=['i','j'], right_on = ['i','j'])[[pol, 'geometry']] # columns to keep, shape 599 by 2
+    # merged_df = gdf.merge(df, how='right', on=['i', 'j'])
+    # print(merged_df.sort_values(['pm'], ascending=[False]).head())
+    # print(merged_df.shape)
+    new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    df.to_file(new_name)
+
+    # Add projection file
+    from shutil import copy2
+    copy2('MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+
+""" normalized facilities """
+def normalize_total_damages2(fn, shpfn, pol, name, points, scc_name='', scc=[]):
+    # df = new_pmeds(fn, shpfn, pol, scc_name, scc)
+    df = damages(fn, points, shpfn, pol)
+
+    # Get max total square
+    df2 = damages3(fn, shpfn, pol, name, points, scc_name='Both', scc=[])
+    # df2 = calculate_total2(fn, shpfn, pol, 'PM2.5T', 10, scc_name='Both', scc=[])
+    max_v = max(df2[pol])
+    name = 'PM2.5 damages'
+    df[pol] = df[name]/max_v
+
+    # i (int64) range 163 to 214
+    # j (int64) range 115 to 149
+    # df shape 599 by 20
+    # print(df.shape)
+    # print(df.head())
+    # print(df['j'].min())
+    # print(df['j'].max())
+    print(df.shape)
+
+    # print(df.sort_values(['pm'], ascending=[False]).head())
+    # Join with grid shapefile
+    # gdf = gpd.read_file(shpfn) # gdf shape 93411 by 4
+    # # print(gdf.dtypes)
+    #
+    # # NOTE: Make sure dtypes of the columns in both tables are the same
+    # # gdf['i'] = gdf['i'].map(lambda x: 291 - x) # switch which side i starts from
+    # # gdf['j'] = gdf['j'].map(lambda x: x+1) # fix j being off by 1
+    # # x/j is 1 to 321, y/i is 1 to 291
+    # # Keep only right or inner
+    # merged_df = gdf.merge(df,  how='right', left_on=['i','j'], right_on = ['i','j'])[[pol, 'geometry']] # columns to keep, shape 599 by 2
+    # merged_df = gdf.merge(df, how='right', on=['i', 'j'])
+    # print(merged_df.sort_values(['pm'], ascending=[False]).head())
+    # print(merged_df.shape)
+    new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    df.to_file(new_name)
+
+    # Add projection file
+    # from shutil import copy2
+    # copy2('MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+
+def pop_dens(shpfn):
+    pop = gpd.read_file('fresno_pop/fresnopop.shp').to_crs(epsg=4326)
+    blocks = gpd.read_file(shpfn).to_crs(epsg=4326) # match crs of facilities
+    pop['geometry'] = pop['geometry'].centroid # set all blocks to points
+    # print(pop.iloc[0]['geometry'].centroid)
+    # Gives table of facilities with column 'index_right' being which polygon each falls in
+    facilities = gpd.sjoin(pop, blocks, op='within')
+    name = 'POP10'
+    # Sums pollutants for all points within a certain polygon
+    total = facilities.groupby('index_right')[name].sum().to_frame() # need to convert Series to DF
+    # Join counted values for each blockgroup back to blockgroups by blockgroup index and drop unmatched rows
+    # Can also do blockgroups.merge(total, on="right_index")
+    blocks = blocks.join(total).dropna()
+
+    # pop['density'] = pop['POP10']/pop['geometry'].area
+    # new_name = save_name('facilities/' + 'pop' + '_Fresno', '.shp')
+    # blocks.to_file(new_name)
     return blocks
+
+def pop_emissions(fn, shpfn, pol, name, points, scc_name='', scc=[]):
+    pop = pop_dens(shpfn)[['i', 'j', 'POP10']] # get rid of geometry for join
+    em = calculate_total2(fn, shpfn, pol, name, points, scc_name, scc)
+
+    # Add the two
+    merged_df = em.merge(pop,  how='outer', left_on=['i','j'], right_on = ['i','j'])[[pol, 'POP10', 'geometry']] # can't hash on geometry
+    # merged_df = gpd.GeoDataFrame(merged_df) # reconvert to gdf after merge
+    merged_df['POP10'] = merged_df[pol] * merged_df['POP10']
+    merged_df = merged_df[['i', 'j', 'POP10', 'geometry']]
+    # new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    # merged_df.to_file(new_name)
+    return merged_df
+
+def pop_emissions2(fn, shpfn, pol, name, points, scc_name='', scc=[]):
+    df = pop_emissions('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name, scc)
+    df2 = pop_emissions('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='Both', scc=[])
+
+
+def norm_pop(fn, shpfn, pol, name, points, scc_name='', scc=[]):
+    pop = pop_dens(shpfn) # get rid of geometry for join
+    max_v = max(pop['POP10'])
+    pop['POP10'] = pop['POP10']/max_v
+    em = calculate_total2(fn, shpfn, pol, name, points, scc_name, scc)[['i', 'j', pol]]
+
+    # Add the two
+    merged_df = pop.merge(em,  how='outer', left_on=['i','j'], right_on = ['i','j'])[[pol, 'POP10', 'geometry']] # can't hash on geometry
+    # merged_df = gpd.GeoDataFrame(merged_df) # reconvert to gdf after merge
+    merged_df['POP10'] = merged_df[pol] * merged_df['POP10']
+    merged_df = merged_df[['POP10', 'geometry']]
+    new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
+    merged_df.to_file(new_name)
+    # return merged_df
+
+"""
+Folium Visualization
+"""
 
 # Creates choropleth folium map object
 # http://andrewgaidus.com/leaflet_webmaps_python/
@@ -214,10 +885,6 @@ def add_points(mapobj, gdf, popup_field_list):
     mapobj.add_child(pt_lyr)
     return mapobj
 
-"""
-Main Visualization Functions
-"""
-
 def map_pollutant(name='PMT', basemap='OpenStreetMap'):
     # Create Fresno basemap specifying map center, zoom level, and using the default OpenStreetMap tiles
     # “Mapbox Bright” (Limited levels of zoom for free tiles)
@@ -306,108 +973,11 @@ def ces_layer(m):
     # m.save(save_name('ces', ".html"))
     return m
 
-# https://gis.stackexchange.com/questions/54119/creating-square-grid-polygon-shapefile-with-python?rq=1
-# measurements in meters
-def create_grid(name="test.shp", xmin=-684000, xmax=600000, ymin=-564000, ymax=600000, gridHeight=4000, gridWidth=4000):
-    xmin = float(xmin)
-    xmax = float(xmax)
-    ymin = float(ymin)
-    ymax = float(ymax)
-    gridWidth = float(gridWidth)
-    gridHeight = float(gridHeight)
 
-    # get rows
-    rows = math.ceil((ymax-ymin)/gridHeight)
-    # get columns
-    cols = math.ceil((xmax-xmin)/gridWidth)
-
-    # start grid cell envelope
-    ringXleftOrigin = xmin
-    ringXrightOrigin = xmin + gridWidth
-    ringYtopOrigin = ymax
-    ringYbottomOrigin = ymax-gridHeight
-
-    # create output file
-    outDriver = ogr.GetDriverByName('ESRI Shapefile')
-    if os.path.exists(name):
-        os.remove(name)
-    outDataSource = outDriver.CreateDataSource(name)
-    outLayer = outDataSource.CreateLayer(name,geom_type=ogr.wkbPolygon )
-    featureDefn = outLayer.GetLayerDefn()
-
-    # create grid cells
-    countcols = 0
-    while countcols < cols:
-        countcols += 1
-
-        # reset envelope for rows
-        ringYtop = ringYtopOrigin
-        ringYbottom =ringYbottomOrigin
-        countrows = 0
-
-        while countrows < rows:
-            countrows += 1
-            ring = ogr.Geometry(ogr.wkbLinearRing)
-            ring.AddPoint(ringXleftOrigin, ringYtop)
-            ring.AddPoint(ringXrightOrigin, ringYtop)
-            ring.AddPoint(ringXrightOrigin, ringYbottom)
-            ring.AddPoint(ringXleftOrigin, ringYbottom)
-            ring.AddPoint(ringXleftOrigin, ringYtop)
-            poly = ogr.Geometry(ogr.wkbPolygon)
-            poly.AddGeometry(ring)
-
-            # add new geom to layer
-            outFeature = ogr.Feature(featureDefn)
-            outFeature.SetGeometry(poly)
-            outLayer.CreateFeature(outFeature)
-            outFeature.Destroy
-
-            # new envelope for next poly
-            ringYtop = ringYtop - gridHeight
-            ringYbottom = ringYbottom - gridHeight
-
-        # new envelope for next poly
-        ringXleftOrigin = ringXleftOrigin + gridWidth
-        ringXrightOrigin = ringXrightOrigin + gridWidth
-
-    # Close DataSources
-    outDataSource.Destroy()
-
-def create_grid2(name="test", minx=-684000, maxx=600000, miny=-564000, maxy=600000, dx=4000, dy=4000):
-
-    nx = int(math.ceil(abs(maxx - minx)/dx))
-    ny = int(math.ceil(abs(maxy - miny)/dy))
-
-    w = shp.Writer(shp.POLYGON)
-    w.autoBalance = 1
-    w.field("ID")
-    w.field('i')
-    w.field('j')
-    id=0
-
-    for i in range(ny):
-        for j in range(nx):
-            id+=1
-            vertices = []
-            parts = []
-            vertices.append([min(minx+dx*j,maxx),max(maxy-dy*i,miny)])
-            vertices.append([min(minx+dx*(j+1),maxx),max(maxy-dy*i,miny)])
-            vertices.append([min(minx+dx*(j+1),maxx),max(maxy-dy*(i+1),miny)])
-            vertices.append([min(minx+dx*j,maxx),max(maxy-dy*(i+1),miny)])
-            parts.append(vertices)
-            w.poly(parts)
-            w.record(id,i,j)
-
-    w.save(name)
-    # projection info
-    # prj = open("%s.prj" % name, "w")
-    # epsg = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6370000,6370000]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]'
-    # epsg = 'GEOGCS["LCC",DATUM["LCC",SPHEROID["LCC",6370000,6370000]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]'
-    # prj.write(epsg)
-    # prj.close()
 
 def map_grid(basemap='OpenStreetMap'):
-    gdf = gpd.read_file('test.shp')
+    # gdf = gpd.read_file('grid.shp')
+    gdf = gpd.read_file('MEDS/output/nox_Fresno_07d15col1.shp').to_crs(epsg=4326)
     # gdf_wgs84 = gdf.to_crs({'init': 'epsg:4326'})
     gj = json.loads(gdf.to_json())
     m = folium.Map(location=[36.6, -119.6], zoom_start=9, tiles=basemap)
@@ -424,37 +994,15 @@ def map_grid(basemap='OpenStreetMap'):
     # Save map
     m.save(save_name("name", ".html"))
 
-def convert_pmeds(fn, shpfn):
-    # Read in fixed-width columns
-    df = pd.read_fwf(fn, widths=[8, 14, 14, 3, 3, 9, 5, 2, 5, 2, 2, 3, 3, 5], skiprows=0, header=None)
-    # Read comma-separated columns; assumes no commas in first 79 characters
-    df2 = pd.read_csv(fn, header=None)
-    df2[df2.columns[0]] = df2[df2.columns[0]].map(lambda x: x[78:])
-    # Join dataframes
-    df = pd.concat([df, df2], axis=1)
-    # Name column
-    df.columns = ['scenario', 'sic', 'scc', 'i', 'j', 'facid', 'stackid', 'county',
-    'julianday', 'beginhour', 'endhour', 'airbasin', 'subcounty', 'elevation', 'co', 'nox', 'sox', 'tog', 'pm', 'nh3']
-    # print(df.head())
-    # Add up individual facilities' pm
-    df['pm'] = df.groupby(['i', 'j'])['pm'].transform('sum')
-    df = df.drop_duplicates(['i', 'j'])
-
-    # print(df.sort_values(['pm'], ascending=[False]).head())
-    # Join with grid shapefile
-    gdf = gpd.read_file(shpfn)
-    # print(gdf.shape)
-
-    merged_df = gdf.merge(df,  how='left', left_on=['j','i'], right_on = ['i','j'])[['pm', 'geometry']] # columns to keep
-    # merged_df = gdf.merge(df, how='right', on=['i', 'j'])
-    print(merged_df.sort_values(['pm'], ascending=[False]).head())
-    # print(merged_df.shape)
 
 
 def main():
     """ source activate pol """
+    # agg_facilities_column('grid', 'Fresno', 'PM2.5T')
+    # agg_pmeds_column('LA', 'PM2.5T', 'Both', 'percent', damages=True)
+
     # map_pollutant('PM2.5T', basemap='CartoDB Positron')
-    # create_grid2('test2')
+    # create_grid('grid')
     # map_grid()
 
     # print(most_polluting('PMT', 10))
@@ -463,7 +1011,32 @@ def main():
 
     # map_pop_dens()
 
-    convert_pmeds('MEDS/Fresno_07d31', 'test2.shp')
+    # convert_pmeds('MEDS/Fresno_07d15', 'grid.shp', 'pm', scc_name='LD', scc=[202,203,204,205,206,207,209,210,211,212,213,214,215,216,218,219,221,808,813,814,817,820])
+    # convert_pmeds('MEDS/Fresno_07d15', 'grid.shp', 'pm', scc_name='HD', scc=[302,303,304,305,306,307,309,310,311,312,313,314,315,316,318,319,321,408,508,413,513,613,414,514,614,617,717,420,520,620])
+    # normalize_pmeds('MEDS/Fresno_07d15', 'grid.shp', 'pm', scc_name='Both', scc=[])
+    # normalize_total2('MEDS/Fresno_07d15', 'grid.shp', 'pm', scc_name='Fac')
+    # calculate_total('MEDS/Fresno_07d15', 10, 'grid.shp', 'pm', scc_name='LD')
+    # damages('MEDS/Fresno_07d15', 10, 'grid.shp', 'pm')
+    # pop_dens('grid.shp')
+    # agg_points_col2('PM2.5T', 10, 'grid.shp')
+    # calculate_total2('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='Both', scc=[])
+    # damages2('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='LD', scc=[202,203,204,205,206,207,209,210,211,212,213,214,215,216,218,219,221,808,813,814,817,820])
+    # damages3('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10)
+    # damages2('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='HD', scc=[302,303,304,305,306,307,309,310,311,312,313,314,315,316,318,319,321,408,508,413,513,613,414,514,614,617,717,420,520,620])
+    # damages2('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='Both', scc=[])
+    # normalize_total_damages('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='LD', scc=[202,203,204,205,206,207,209,210,211,212,213,214,215,216,218,219,221,808,813,814,817,820])
+    # normalize_total_damages('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='HD', scc=[302,303,304,305,306,307,309,310,311,312,313,314,315,316,318,319,321,408,508,413,513,613,414,514,614,617,717,420,520,620])
+    # normalize_total_damages2('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='HD', scc=[])
+    # pop_emissions('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='Both', scc=[])
+    # norm_pop('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='Both', scc=[])
+    # pop_emissions2('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='LD', scc=[202,203,204,205,206,207,209,210,211,212,213,214,215,216,218,219,221,808,813,814,817,820])
+    # grid = gpd.read_file('grid2.shp')
+    # print(max(grid['i']))
+    # print(max(grid['j']))
+    # print(min(grid['i']))
+    # print(min(grid['j']))
+    # print(grid.head)
+    # print(grid.shape)
 
 
 if __name__ == "__main__":

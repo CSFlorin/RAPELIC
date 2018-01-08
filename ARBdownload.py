@@ -16,12 +16,22 @@ def download_facility(infile, outdirectory):
         facilities.set_value(index, 'PM2.5T', temp_f.loc[temp_f['POLLUTANT NAME'] == 'PM2.5'].iloc[0]['EMISSIONS_TONS_YR'])
     facilities.to_csv('test.csv')
 
+def download_both(outdirectory):
+    for i in range(2, 59):
+        new_file = outdirectory + str(i) + ".csv"
+        facilities = pd.read_csv("https://www.arb.ca.gov/app/emsinv/facinfo/faccrit_output.csv?&dbyr=2015&ab_=&dis_=&co_=" + str(i) + "&fname_=&city_=&sort=FacilityNameA&fzip_=&fsic_=&facid_=&all_fac=C&chapis_only=&CERR=&dd=")
+        for index, row in facilities.iterrows():
+            temp_f = pd.read_csv("https://www.arb.ca.gov/app/emsinv/facinfo/facdet_output.csv?&dbyr=2015&ab_=" + str(row['AB']) + "&dis_=" + str(row['DIS']) + "&co_=" + str(row['CO']) + "&fname_=&city_=&sort=C&fzip_=&fsic_=&facid_=" + str(row['FACID']) + "&all_fac=&chapis_only=&CERR=&dd=")
+            facilities.set_value(index, 'PM2.5T', temp_f.loc[temp_f['POLLUTANT NAME'] == 'PM2.5'].iloc[0]['EMISSIONS_TONS_YR'])
+        facilities.to_csv(new_file)
+
 
 def main():
     outdirectory = 'ARB/'
     # download(outdirectory)
-    outdirectory = 'fresno_facilities'
-    download_facility('fresno_industry_arb.csv', outdirectory)
+    # outdirectory = 'fresno_facilities'
+    # download_facility('fresno_industry_arb.csv', outdirectory)
+    download_both(outdirectory)
 
 
 
