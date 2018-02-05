@@ -87,7 +87,7 @@ def read_facilities(county):
     facilities = facilities[facilities.within(read_census_shape('blockgroup', county).unary_union)] # Drop rows outside region in case any were misgeocoded
     return facilities
 
-def agg_facilities_column(area, county, column, output='percent', damages=True, save=False):
+def agg_facilities_column(area, county, column, output='percent', damages=False, save=False):
     """
     Return geopandas dataframe with values of column added up for all facilities in each polygon
         area: 'blockgroup', 'block', 'grid'
@@ -223,7 +223,7 @@ def agg_pmeds_column(county, column, scc='', output='percent', updated=True, dam
     if scc == 'LD':
         df = df[df['SCC'].isin([202,203,204,205,206,207,209,210,211,212,213,214,215,216,218,219,221,808,813,814,817,820])]
     elif scc == 'HD':
-        df = df[df['SCC'].isin([302,303,304,305,306,307,309,310,311,312,313,314,315,316,318,319,321,408,508,413,513,613,414,514,614,617,717,420,520,620])]
+        df = df[df['SCC'].isin([302,303,304,305,306,307,309,310,311,312,313,314,315,316,318,319,321,408,413,420,414,508,513,514,520,613,614,617,620,717])]
 
     # Add up individual squares' pm
     df[column] = df.groupby(['i', 'j'])[column].transform('sum') # Add each row containing same i, j, but keep dupes
@@ -288,6 +288,7 @@ def agg_pmeds_column(county, column, scc='', output='percent', updated=True, dam
         # Add projection file
         from shutil import copy2
         copy2('data/MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+        print("Saved " + new_name)
 
     return merged_df
 
@@ -297,7 +298,7 @@ def combine_pmeds_facilities(county, column, scc='', output='percent', updated=T
         county: 'LA', 'Fresno'
         column: 'PM2.5T', 'PMT', 'SOXT', 'NOXT', 'COT', 'TOGT'
         scc: 'LD', 'HD', '' for all
-        output: 'percent', 'actual'
+        output: 'percent' for percent of total that each grid cell is, 'actual'
         updated: If output == 'actual', True to update to 2015 values
         damages: If output == 'percent', True to calculate cell damages and False for just cell percents
         save: Whether to save frame to shapefile
@@ -326,5 +327,79 @@ def combine_pmeds_facilities(county, column, scc='', output='percent', updated=T
         # Add projection file
         from shutil import copy2
         copy2('data/MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+        print("Saved " + new_name)
 
     return df
+
+def facilities_to_pmeds(county, column, updated=True, save=False):
+    """
+    Return geodataframe of percent that HD, LD, all vehicles (Both), and I are of total of column for each grid cell
+        county: 'LA', 'Fresno'
+        column: 'PM2.5T', 'PMT', 'SOXT', 'NOXT', 'COT', 'TOGT'
+        updated: True to update to 2015 values
+        save: Whether to save frame to shapefile
+    """
+    # Calculate raw PMEDS frames
+    pmeds_ld = agg_pmeds_column(county, column, 'LD', 'actual', updated)
+    pmeds_hd = agg_pmeds_column(county, column, 'HD', 'actual', updated)
+    pmeds = agg_pmeds_column(county, column, '', 'actual', updated)
+    print(pmeds.shape)
+    # Calculate raw facilities frame
+    facilities = agg_facilities_column('grid', county, column, 'actual')
+    print(facilities.shape)
+    total = pd.concat([pmeds, facilities])
+    # Add up individual squares' pm
+    total[column] = total.groupby(['i', 'j'])[column].transform('sum') # Add each row containing same i, j, but keep dupes
+    total = total.drop_duplicates(['i', 'j']) # Get rid of dupes
+    print(total.shape)
+    total = total[total[column] != 0]
+    print(total.shape)
+
+    # Industry
+    total = total.merge(facilities,  how='left', on=['i','j'])[[column + '_x', column + '_y', 'geometry_x', 'i', 'j']] # columns to keep
+    total['I'] = total.apply(lambda row: (row[column+'_y']/row[column+'_x'])*100, axis=1) # facilities/total
+    total.rename(columns = {'geometry_x':'geometry', column + '_x': column}, inplace = True)
+    total = total.drop(column + '_y', 1)
+    total = gpd.GeoDataFrame(total)
+
+    # LD
+    total = total.merge(pmeds_ld,  how='left', on=['i','j'])[[column + '_x', column + '_y', 'geometry_x', 'i', 'j', 'I']] # columns to keep
+    total['LD'] = total.apply(lambda row: (row[column+'_y']/row[column+'_x'])*100, axis=1) # ld/total
+    total.rename(columns = {'geometry_x':'geometry', column + '_x': column}, inplace = True)
+    total = total.drop(column + '_y', 1)
+    total = gpd.GeoDataFrame(total)
+
+    # HD
+    total = total.merge(pmeds_hd,  how='left', on=['i','j'])[[column + '_x', column + '_y', 'geometry_x', 'i', 'j', 'I', 'LD']] # columns to keep
+    total['HD'] = total.apply(lambda row: (row[column+'_y']/row[column+'_x'])*100, axis=1) # hd/total
+    total.rename(columns = {'geometry_x':'geometry', column + '_x': column}, inplace = True)
+    total = total.drop(column + '_y', 1)
+    total = gpd.GeoDataFrame(total)
+
+    # Both LD and HD
+    total = total.merge(pmeds,  how='left', on=['i','j'])[[column + '_x', column + '_y', 'geometry_x', 'i', 'j', 'I', 'LD', 'HD']] # columns to keep
+    total['Both'] = total.apply(lambda row: (row[column+'_y']/row[column+'_x'])*100, axis=1) # both/total
+    total.rename(columns = {'geometry_x':'geometry', column + '_x': column}, inplace = True)
+    total = total.drop(column + '_y', 1)
+    total = gpd.GeoDataFrame(total)
+
+    def dominant_percentage(row):
+        max_column = max(row['I'], row['LD'], row['HD'])
+        if max_column == row['I']:
+            return 'I'
+        if max_column == row['LD']:
+            return 'LD'
+        return 'HD'
+
+    total['Dominant'] = total.apply(dominant_percentage, axis=1)
+
+    print(total.head())
+    print(total.dtypes)
+
+    if save:
+        new_name = save_name('out/combined/' + county + column, '.shp')
+        total.to_file(new_name)
+        # Add projection file
+        from shutil import copy2
+        copy2('data/MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+        print("Saved " + new_name)

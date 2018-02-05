@@ -27,56 +27,17 @@ import shapefile as shp # pyshp
 import math
 from helpers import save_name, county_code, read_census_shape, read_facilities,\
 agg_facilities_column, agg_facilities_allcols, create_grid, read_pmeds, agg_pmeds_column,\
-combine_pmeds_facilities
+combine_pmeds_facilities, facilities_to_pmeds
 
+def main():
+    """ source activate pol """
 
-combine_pmeds_facilities('Fresno', 'PM2.5T', damages=True, save=True)
-exit()
+    # combine_pmeds_facilities('Fresno', 'PM2.5T', damages=True, save=True)
+    facilities_to_pmeds('LA', 'PM2.5T', save=True)
+    exit()
 
-""" Get percent that SCC_NAME (HD, LD, or I) is of total of POL
-    COID is 19 for LA, 10 for Fresno
-"""
-def calculate_total(fn, coid, shpfn, pol, scc_name=''):
-    df = read_pmeds(fn)
-
-    # Codes from PMEDS SCC Emission Categories Chart
-    if scc_name == 'HD':
-        numerator = df[df['scc'].isin([302,303,304,305,306,307,309,310,311,312,313,314,315,316,318,319,321,408,508,413,513,613,414,514,614,617,717,420,520,620])].copy()
-    else: # LD
-        numerator = df[df['scc'].isin([202,203,204,205,206,207,209,210,211,212,213,214,215,216,218,219,221,808,813,814,817,820])].copy()
-
-    # Add up individual squares' pm
-    df[pol] = df.groupby(['i', 'j'])[pol].transform('sum') # adds each row containing same i, j, but keeps dupes
-    df = df.drop_duplicates(['i', 'j']) # get rid of dupe rows
-    numerator[pol] = numerator.groupby(['i', 'j'])[pol].transform('sum') # adds each row containing same i, j, but keeps dupes
-    numerator = numerator.drop_duplicates(['i', 'j']) # get rid of dupes
-
-    # Normalize scc_name over total pol for pmeds
-    numerator = numerator.merge(df,  how='inner', on=['i','j'])[['i', 'j', pol+'_x', pol+'_y']]
-    df_max = max(df[pol])
-    numerator[pol] = numerator.apply(lambda row: row[pol+'_x']/df_max, axis=1) # row[pol+'_y']
-    # Multiply by appropriate mobile sources from https://www.arb.ca.gov/app/emsinv/2017/emssumcat_query.php?F_YR=2015&F_DIV=-4&F_SEASON=A&SP=SIP105ADJ&F_AREA=CO&F_CO=10&F_COAB=#7
-    if scc_name == 'LD':
-        numerator[pol] = numerator[pol].map(lambda x: 365*.35*x) # and convert from tons/day to tons/year
-    else: # HD
-        numerator[pol] = numerator[pol].map(lambda x: 365*.74*x)
-    numerator = numerator[[pol, 'i', 'j']]
-
-    total = add_pmeds_facilities(fn, coid, shpfn, pol)
-    # Keep only right or inner
-    merged_df = total.merge(numerator,  how='inner', on=['i','j'])[[pol + '_x', pol + '_y', 'geometry']] # columns to keep, shape 599 by 2
-    merged_df[pol] = merged_df.apply(lambda row: row[pol+'_y']/row[pol+'_x'], axis=1) # numerator/total
-    # merged_df = merged_df[pd.notnull(merged_df[pol])]
-    # merged_df = gdf.merge(df, how='right', on=['i', 'j'])
-    # print(merged_df.sort_values(['pm'], ascending=[False]).head())
-    # print(merged_df.shape)
-    new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name + '_total', '.shp')
-    merged_df[[pol, 'geometry']].to_file(new_name)
-
-    # No need to add projection file since we reprojected in geopandas
-    # Add projection file
-    # from shutil import copy2
-    # copy2('MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+if __name__ == "__main__":
+    main()
 
 def pop_dens(shpfn):
     pop = gpd.read_file('fresno_pop/fresnopop.shp').to_crs(epsg=4326)
@@ -405,8 +366,7 @@ def main():
     # print(grid.shape)
 
 
-if __name__ == "__main__":
-    main()
+
 
 
 
