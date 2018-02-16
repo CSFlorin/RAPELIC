@@ -27,49 +27,19 @@ import shapefile as shp # pyshp
 import math
 from helpers import save_name, county_code, read_census_shape, read_facilities,\
 agg_facilities_column, agg_facilities_allcols, create_grid, read_pmeds, agg_pmeds_column,\
-combine_pmeds_facilities, facilities_to_pmeds
+combine_pmeds_facilities, facilities_to_pmeds, shape_pop, pop_emissions
 
 def main():
     """ source activate pol """
 
     # combine_pmeds_facilities('Fresno', 'PM2.5T', damages=True, save=True)
-    facilities_to_pmeds('LA', 'PM2.5T', save=True)
+    # facilities_to_pmeds('LA', 'PM2.5T', save=True)
+    # shape_pop('block', save=True)
+    pop_emissions('grid', 'Fresno', 'PM2.5T', save=True)
     exit()
 
 if __name__ == "__main__":
     main()
-
-def pop_dens(shpfn):
-    pop = gpd.read_file('fresno_pop/fresnopop.shp').to_crs(epsg=4326)
-    blocks = gpd.read_file(shpfn).to_crs(epsg=4326) # match crs of facilities
-    pop['geometry'] = pop['geometry'].centroid # set all blocks to points
-    # print(pop.iloc[0]['geometry'].centroid)
-    # Gives table of facilities with column 'index_right' being which polygon each falls in
-    facilities = gpd.sjoin(pop, blocks, op='within')
-    name = 'POP10'
-    # Sums pollutants for all points within a certain polygon
-    total = facilities.groupby('index_right')[name].sum().to_frame() # need to convert Series to DF
-    # Join counted values for each blockgroup back to blockgroups by blockgroup index and drop unmatched rows
-    # Can also do blockgroups.merge(total, on="right_index")
-    blocks = blocks.join(total).dropna()
-
-    # pop['density'] = pop['POP10']/pop['geometry'].area
-    # new_name = save_name('facilities/' + 'pop' + '_Fresno', '.shp')
-    # blocks.to_file(new_name)
-    return blocks
-
-def pop_emissions(fn, shpfn, pol, name, points, scc_name='', scc=[]):
-    pop = pop_dens(shpfn)[['i', 'j', 'POP10']] # get rid of geometry for join
-    em = calculate_total2(fn, shpfn, pol, name, points, scc_name, scc)
-
-    # Add the two
-    merged_df = em.merge(pop,  how='outer', left_on=['i','j'], right_on = ['i','j'])[[pol, 'POP10', 'geometry']] # can't hash on geometry
-    # merged_df = gpd.GeoDataFrame(merged_df) # reconvert to gdf after merge
-    merged_df['POP10'] = merged_df[pol] * merged_df['POP10']
-    merged_df = merged_df[['i', 'j', 'POP10', 'geometry']]
-    # new_name = save_name('MEDS/output/' + pol + fn.replace('MEDS/', '_') + scc_name, '.shp')
-    # merged_df.to_file(new_name)
-    return merged_df
 
 def pop_emissions2(fn, shpfn, pol, name, points, scc_name='', scc=[]):
     df = pop_emissions('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name, scc)

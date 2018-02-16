@@ -61,15 +61,17 @@ def county_code(county, file_type):
 def read_census_shape(area, county=''):
     """
     Read California census area shapefile into a GeoDataFrame and return it filtered to a county if specified
-        area: 'blockgroup', 'block'
+        area: 'blockgroup', 'block', 'pop'
         county: 'LA', 'Fresno'
     """
     if area == 'blockgroup':
         area = gpd.read_file('data/ca_blockgroup/tl_2016_06_bg.shp')
     elif area == 'block':
         area = gpd.read_file('data/ca_block/tl_2016_06_tabblock10.shp')
+    elif area == 'pop': # block level
+        area = gpd.read_file('data/fresno_pop/fresnopop.shp')
     else:
-        raise ValueError('area must be LA or Fresno')
+        raise ValueError('check read_census_shape for valid areas')
 
     if county: # Only keep area in that county if specified
         area = area[area['COUNTYFP'] == county_code(county, 'census_area')]
@@ -403,3 +405,56 @@ def facilities_to_pmeds(county, column, updated=True, save=False):
         from shutil import copy2
         copy2('data/MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
         print("Saved " + new_name)
+
+    return total
+
+def shape_pop(area, save=False):
+    """
+    Return geodataframe of population in each polygon of area added up. Uses centroids of original population blocks to match to new area.
+        area: 'blockgroup', 'grid'
+        county: 'LA', 'Fresno'
+        save: Whether to save frame to shapefile
+    """
+    pop = read_census_shape('pop').to_crs(epsg=4326)
+    pop['geometry'] = pop['geometry'].centroid # set all blocks to points
+
+    gdf = gpd.read_file('data/MEDS/grid.shp').to_crs(epsg=4326) # gdf shape 93411 by 4
+    # Gives table of pop with column 'index_right' being which polygon each falls in
+    total = gpd.sjoin(pop, gdf, op='within')
+    total = total.groupby('index_right')['POP10'].sum().to_frame() # need to convert Series to DF
+    total = gdf.join(total).dropna()[['i', 'j', 'POP10', 'geometry']]
+
+    if save:
+        new_name = save_name('out/combined/pop_' + area, '.shp')
+        total.to_file(new_name)
+        # No projection needed since coordinate system defined
+        print("Saved " + new_name)
+
+    # TODO: pop['density'] = pop['POP10']/pop['geometry'].area
+
+    return total
+
+def pop_emissions(area, county, column, save=False):
+    """
+    Return geodataframe of population in each polygon of area added up and multiplied by pollution
+        area: 'blockgroup', 'grid'
+        county: 'LA', 'Fresno'
+        column: 'PM2.5T', 'PMT', 'SOXT', 'NOXT', 'COT', 'TOGT'
+        save: Whether to save frame to shapefile
+    """
+    pop = shape_pop('grid')[['i', 'j', 'POP10']] # get rid of geometry for join
+    em = combine_pmeds_facilities(county, column, output='actual', updated=True)
+
+    total = em.merge(pop,  how='outer', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', column, 'POP10', 'geometry']] # can't hash on geometry
+    total['POP10'] = total[column] * total['POP10']
+    total = total[['i', 'j', 'POP10', 'geometry']]
+
+    if save:
+        new_name = save_name('out/combined/' + county + column, '.shp')
+        total.to_file(new_name)
+        # Add projection file
+        from shutil import copy2
+        copy2('data/MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+        print("Saved " + new_name)
+
+    return total
