@@ -415,14 +415,21 @@ def shape_pop(area, save=False):
         county: 'LA', 'Fresno'
         save: Whether to save frame to shapefile
     """
-    pop = read_census_shape('pop').to_crs(epsg=4326)
-    pop['geometry'] = pop['geometry'].centroid # set all blocks to points
-
-    gdf = gpd.read_file('data/MEDS/grid.shp').to_crs(epsg=4326) # gdf shape 93411 by 4
-    # Gives table of pop with column 'index_right' being which polygon each falls in
-    total = gpd.sjoin(pop, gdf, op='within')
-    total = total.groupby('index_right')['POP10'].sum().to_frame() # need to convert Series to DF
-    total = gdf.join(total).dropna()[['i', 'j', 'POP10', 'geometry']]
+    if area == 'blockgroup':
+        pop = read_census_shape('pop')
+        pop['geometry'] = pop['geometry'].centroid # set all blocks to points
+        gdf = read_census_shape('blockgroup')
+        total = gpd.sjoin(pop, gdf, op='within')
+        total = total.groupby('index_right')['POP10'].sum().to_frame() # need to convert Series to DF
+        total = gdf.join(total).dropna()[['GEOID', 'POP10', 'geometry']]
+    else:
+        pop = read_census_shape('pop').to_crs(epsg=4326)
+        pop['geometry'] = pop['geometry'].centroid # set all blocks to points
+        gdf = gpd.read_file('data/MEDS/grid.shp').to_crs(epsg=4326) # gdf shape 93411 by 4
+        # Gives table of pop with column 'index_right' being which polygon each falls in
+        total = gpd.sjoin(pop, gdf, op='within')
+        total = total.groupby('index_right')['POP10'].sum().to_frame() # need to convert Series to DF
+        total = gdf.join(total).dropna()[['i', 'j', 'POP10', 'geometry']]
 
     if save:
         new_name = save_name('out/combined/pop_' + area, '.shp')
@@ -442,19 +449,143 @@ def pop_emissions(area, county, column, save=False):
         column: 'PM2.5T', 'PMT', 'SOXT', 'NOXT', 'COT', 'TOGT'
         save: Whether to save frame to shapefile
     """
-    pop = shape_pop('grid')[['i', 'j', 'POP10']] # get rid of geometry for join
-    em = combine_pmeds_facilities(county, column, output='actual', updated=True)
+    if area == 'blockgroup':
+        pop = shape_pop('blockgroup').to_crs(epsg=4326) # [['GEOID', 'POP10']] # get rid of geometry for join
+        em = combine_pmeds_facilities(county, column, output='actual', updated=True).to_crs(epsg=4326)
+        em['geometry'] = em['geometry'].centroid # set all grid cells to points
+        total = gpd.sjoin(em, pop, op='within')
+        total = total.groupby('index_right')[column].sum().to_frame() # need to convert Series to DF
+        total = pop.join(total).dropna() # [['i', 'j', 'POP10', 'geometry']]
+        total['POP10'] = total[column] * total['POP10']
+        total = total[['GEOID', 'POP10', 'geometry']]
+    else:
+        pop = shape_pop('grid')[['i', 'j', 'POP10']] # get rid of geometry for join
+        em = combine_pmeds_facilities(county, column, output='actual', updated=True)
 
-    total = em.merge(pop,  how='outer', left_on=['i','j'], right_on = ['i','j'])[['i', 'j', column, 'POP10', 'geometry']] # can't hash on geometry
-    total['POP10'] = total[column] * total['POP10']
-    total = total[['i', 'j', 'POP10', 'geometry']]
+        total = em.merge(pop,  how='outer', on=['i', 'j'])[['i', 'j', column, 'POP10', 'geometry']] # can't hash on geometry
+        total['POP10'] = total[column] * total['POP10']
+        total = total[['i', 'j', 'POP10', 'geometry']]
 
     if save:
         new_name = save_name('out/combined/' + county + column, '.shp')
         total.to_file(new_name)
-        # Add projection file
-        from shutil import copy2
-        copy2('data/MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+        if area == 'grid':
+            # Add projection file
+            from shutil import copy2
+            copy2('data/MEDS/_mm5_sphere_.prj', new_name.replace('.shp', '.prj'))
+        print("Saved " + new_name)
+
+    return total
+
+def shape_ethnicity(area, county, save=False):
+    """
+    Return geodataframe of percent that each ethnicity is in shape
+        area: 'block', 'grid'
+        county: 'Los Angeles', 'Fresno'
+        save: Whether to save frame to shapefile
+    """
+    gdf = gpd.read_file('data/ces3shp/CES3Results.shp').to_crs(epsg=4326)
+    gdf = gdf[gdf['County'] == county][['Hispanic__', 'White____', 'African_Am', 'Native_Ame', 'Asian_Amer', 'Other____', 'geometry']]
+
+    # Convert fields from object to float
+    gdf = gdf[gdf['Hispanic__'] != '<Null>']
+    gdf['Hispanic__'] = gdf['Hispanic__'].astype(str).astype(float)
+    gdf = gdf[gdf['White____'] != '<Null>']
+    gdf['White____'] = gdf['White____'].astype(str).astype(float)
+    gdf = gdf[gdf['African_Am'] != '<Null>']
+    gdf['African_Am'] = gdf['African_Am'].astype(str).astype(float)
+    gdf = gdf[gdf['Native_Ame'] != '<Null>']
+    gdf['Native_Ame'] = gdf['Native_Ame'].astype(str).astype(float)
+    gdf = gdf[gdf['Asian_Amer'] != '<Null>']
+    gdf['Asian_Amer'] = gdf['Asian_Amer'].astype(str).astype(float)
+    gdf = gdf[gdf['Other____'] != '<Null>']
+    gdf['Other____'] = gdf['Other____'].astype(str).astype(float)
+
+    if area == 'grid':
+        # Squares get value of whatever block their centroid is in
+        grid = gpd.read_file('data/MEDS/grid.shp').to_crs(epsg=4326) # gdf shape 93411 by 4
+        grid['geometry'] = grid['geometry'].centroid # set all blocks to points
+        # Gives table of pop with column 'index_right' being which polygon each falls in
+        gdf = gpd.sjoin(grid, gdf, op='within')[['Hispanic__', 'White____', 'African_Am', 'Native_Ame', 'Asian_Amer', 'Other____', 'i', 'j']]
+        grid = gpd.read_file('data/MEDS/grid.shp').to_crs(epsg=4326) # gdf shape 93411 by 4
+        gdf = grid.merge(gdf,  how='right', on=['i','j'])[['Hispanic__', 'White____', 'African_Am', 'Native_Ame', 'Asian_Amer', 'Other____', 'i', 'j', 'geometry']]
+
+    def dominant_percentage(row):
+        max_column = max(row['Hispanic__'], row['White____'], row['African_Am'], row['Native_Ame'], row['Asian_Amer'], row['Other____'])
+        if max_column == row['Hispanic__']:
+            return 'Hispanic'
+        if max_column == row['White____']:
+            return 'White'
+        if max_column == row['African_Am']:
+            return 'African_Am'
+        if max_column == row['Native_Ame']:
+            return 'Native_Am'
+        if max_column == row['Asian_Amer']:
+            return 'Asian_Am'
+        return 'Other'
+
+    gdf['Dominant'] = gdf.apply(dominant_percentage, axis=1)
+
+    print(gdf.head())
+
+    if save:
+        new_name = save_name('out/combined/eth' + county, '.shp')
+        gdf.to_file(new_name)
+        print("Saved " + new_name)
+
+    return gdf
+
+def shape_income(county, save=False):
+    """
+    Return geodataframe of percentile of poverty in shape
+        area: 'block', 'grid'
+        county: 'Los Angeles', 'Fresno'
+        save: Whether to save frame to shapefile
+    """
+    gdf = gpd.read_file('data/ces3shp/CES3Results.shp').to_crs(epsg=4326)
+    gdf = gdf[gdf['County'] == county][['Pov_pctl', 'geometry', 'Tract_1']]
+
+    if save:
+        new_name = save_name('out/combined/inc' + county, '.shp')
+        gdf.to_file(new_name)
+        print("Saved " + new_name)
+
+    return gdf
+
+def shape_health(county, save=False):
+    """
+    Return geodataframe of percentile of health effects in shape
+        area: 'block', 'grid'
+        county: 'Los Angeles', 'Fresno'
+        save: Whether to save frame to shapefile
+    """
+    gdf = gpd.read_file('data/ces3shp/CES3Results.shp').to_crs(epsg=4326)
+    gdf = gdf[gdf['County'] == county][['CVD_pctl', 'LBW_pctl', 'Asthma_Pct', 'geometry']]
+
+    if save:
+        new_name = save_name('out/combined/health' + county, '.shp')
+        gdf.to_file(new_name)
+        print("Saved " + new_name)
+
+    return gdf
+
+def poverty_emissions(county, column, save=False):
+    """
+        county: 'Los Angeles', 'Fresno'
+        column: 'PM2.5T', 'PMT', 'SOXT', 'NOXT', 'COT', 'TOGT'
+        save: Whether to save frame to shapefile
+    """
+    pov = shape_income(county)
+    # county = 'LA' if county == 'Los Angeles'
+    em = combine_pmeds_facilities(county, column, output='actual', updated=True).to_crs(epsg=4326)
+    em['geometry'] = em['geometry'].centroid # set all grid cells to points
+    total = gpd.sjoin(em, pov, op='within')
+    total = total.groupby('index_right')[column].sum().to_frame() # need to convert Series to DF
+    total = pov.join(total).dropna()
+
+    if save:
+        new_name = save_name('out/combined/pov_emissions' + county, '.shp')
+        total.to_file(new_name)
         print("Saved " + new_name)
 
     return total

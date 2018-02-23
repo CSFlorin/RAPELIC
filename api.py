@@ -27,23 +27,26 @@ import shapefile as shp # pyshp
 import math
 from helpers import save_name, county_code, read_census_shape, read_facilities,\
 agg_facilities_column, agg_facilities_allcols, create_grid, read_pmeds, agg_pmeds_column,\
-combine_pmeds_facilities, facilities_to_pmeds, shape_pop, pop_emissions
+combine_pmeds_facilities, facilities_to_pmeds, shape_pop, pop_emissions, shape_ethnicity,\
+shape_income, shape_health, poverty_emissions
 
 def main():
     """ source activate pol """
 
-    # combine_pmeds_facilities('Fresno', 'PM2.5T', damages=True, save=True)
+    # combine_pmeds_facilities('Fresno', 'PM2.5T', output='actual', damages=False, save=True)
     # facilities_to_pmeds('LA', 'PM2.5T', save=True)
-    # shape_pop('block', save=True)
-    pop_emissions('grid', 'Fresno', 'PM2.5T', save=True)
+    # shape_pop('grid', save=True)
+    # pop_emissions('grid', 'Fresno', 'PM2.5T', save=True)
+    # shape_ethnicity('grid', 'Fresno', save=True)
+    # shape_income('Los Angeles', save=True)
+    # shape_health('Los Angeles', save=True)
+    # shape_pop('blockgroup', save=True)
+    # pop_emissions('blockgroup', 'Fresno', 'PM2.5T', save=True)
+    poverty_emissions('Fresno', 'PM2.5T', save=True)
     exit()
 
 if __name__ == "__main__":
     main()
-
-def pop_emissions2(fn, shpfn, pol, name, points, scc_name='', scc=[]):
-    df = pop_emissions('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name, scc)
-    df2 = pop_emissions('MEDS/Fresno_07d15', 'grid.shp', 'pm', 'PM2.5T', 10, scc_name='Both', scc=[])
 
 
 def norm_pop(fn, shpfn, pol, name, points, scc_name='', scc=[]):
